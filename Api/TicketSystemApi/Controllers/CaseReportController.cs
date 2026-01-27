@@ -1,357 +1,443 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Http;
+using System.Security.Claims;
 using System.Web.Http;
 using Microsoft.Xrm.Sdk;
 using Microsoft.Xrm.Sdk.Query;
 using TicketSystemApi.Services;
 
-[RoutePrefix("api/cases")]
-public class CaseReportController : ApiController
+namespace TicketSystemApi.Controllers
 {
-    [HttpGet]
-    [Route("report")]
-    public IHttpActionResult GetCases(string filter = "all", int page = 1, int? pageSize = null)
+    [Authorize]
+    [RoutePrefix("api/cases")]
+    public class CaseReportController : ApiController
     {
-        try
+        private const string CLAIM_USERNAME = "crm_username";
+        private const string CLAIM_PASSWORD = "crm_password";
+
+        [HttpGet]
+        [Route("report")]
+        public IHttpActionResult GetCases(string filter = "all", int page = 1, int? pageSize = null)
         {
-            var allowedTokens = new List<string>
+            try
+            {
+                var identity = (ClaimsIdentity)User.Identity;
+
+                var username = identity.FindFirst(CLAIM_USERNAME)?.Value;
+                var password = identity.FindFirst(CLAIM_PASSWORD)?.Value;
+                if (string.IsNullOrWhiteSpace(username) || string.IsNullOrWhiteSpace(password))
+                    return Unauthorized();
+
+                var service = new CrmService().GetService1(username, password);
+
+                var query = new QueryExpression("incident")
                 {
-                    System.Configuration.ConfigurationManager.AppSettings["ReportDataToken"],
-                    System.Configuration.ConfigurationManager.AppSettings["ReportDataToken1"]
+                    ColumnSet = new ColumnSet(
+                        "ticketnumber", "createdon", "modifiedon", "statuscode", "prioritycode",
+                        "resolveby", "new_description", "new_ticketsubmissionchannel",
+                        "new_businessunitid", "createdby", "modifiedby", "ownerid", "customerid",
+                        "new_tickettype", "new_mainclassification", "new_subclassificationitem",
+                        "new_isreopened", "new_reopendatetime", "new_reopencount", "new_class",
+
+                        "new_assignmentsucceededon", "new_processingsucceededon", "new_solutionverificationsucceededon",
+
+                        "new_assignmentslaviolationl1", "new_assignmentslaviolationl2", "new_assignmentslaviolationl3",
+                        "new_slaviolationl1", "new_slaviolationl2", "new_slaviolationl3", "new_slaviolationl4",
+                        "new_verificationslaviolationl1", "new_verificationslaviolationl2", "new_verificationslaviolationl3"
+                    ),
+                    PageInfo = new PagingInfo
+                    {
+                        PageNumber = page,
+                        Count = (!pageSize.HasValue || pageSize.Value <= 0) ? int.MaxValue : pageSize.Value,
+                        PagingCookie = null,
+                        ReturnTotalRecordCount = true
+                    }
                 };
 
-            string token = "";
+                query.Orders.Add(new OrderExpression("modifiedon", OrderType.Descending));
 
-            if (Request.Headers.Authorization != null && Request.Headers.Authorization.Scheme == "Bearer")
-            {
-                token = Request.Headers.Authorization.Parameter;
-            }
-            else if (Request.GetQueryNameValuePairs().Any(kvp => kvp.Key == "token"))
-            {
-                token = Request.GetQueryNameValuePairs().First(kvp => kvp.Key == "token").Value;
-            }
+                var ksaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
+                var ksaNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ksaTimeZone);
+                DateTime ksaStart;
 
-            if (!allowedTokens.Contains(token))
-            {
-                return Unauthorized();
-            }
-
-            ICrmService crm = new CrmService();
-            var service = crm.GetService();
-
-            var query = new QueryExpression("incident")
-            {
-                ColumnSet = new ColumnSet(
-                    "ticketnumber", "createdon", "modifiedon", "statuscode", "prioritycode",
-                    "new_ticketclosuredate", "new_description", "new_ticketsubmissionchannel",
-                    "new_businessunitid", "createdby", "modifiedby", "ownerid", "customerid",
-                    "new_tickettype", "new_mainclassification", "new_subclassificationitem",
-                    "new_isreopened", "new_reopendatetime"
-                ),
-                PageInfo = new PagingInfo
+                if (filter.ToLower() == "daily")
                 {
-                    PageNumber = page,
-                    Count = (!pageSize.HasValue || pageSize.Value <= 0) ? int.MaxValue : pageSize.Value,
-                    PagingCookie = null
+                    ksaStart = ksaNow.Date;
+                    query.Criteria.AddCondition("modifiedon", ConditionOperator.OnOrAfter, ksaStart);
+                }
+                else if (filter.ToLower() == "weekly")
+                {
+                    ksaStart = ksaNow.Date.AddDays(-7);
+                    query.Criteria.AddCondition("modifiedon", ConditionOperator.OnOrAfter, ksaStart);
+                }
+                else if (filter.ToLower() == "monthly")
+                {
+                    ksaStart = new DateTime(ksaNow.Year, ksaNow.Month, 1);
+                    query.Criteria.AddCondition("modifiedon", ConditionOperator.OnOrAfter, ksaStart);
+                }
+                else if (filter.ToLower() == "yesterday")
+                {
+                    var yesterdayStart = ksaNow.Date.AddDays(-1);
+                    var yesterdayEnd = ksaNow.Date.AddSeconds(-1);
+
+                    query.Criteria.AddCondition(
+                        new ConditionExpression(
+                            "modifiedon",
+                            ConditionOperator.Between,
+                            new object[] { yesterdayStart, yesterdayEnd }
+                        )
+                    );
                 }
 
+                query.PageInfo.ReturnTotalRecordCount = true;
+
+                var result = service.RetrieveMultiple(query);
+
+                int overallSystemRecords = GetOverallIncidentCount(service);
+                int filteredTotalRecords = result.TotalRecordCount;
+                int currentPageCount = result.Entities.Count;
+
+                int effectivePageSize = pageSize ?? currentPageCount;
+                int totalPages = (int)Math.Ceiling((double)filteredTotalRecords / effectivePageSize);
+
+                var records = result.Entities.Select(e =>
+                {
+                    var slaDetails = GetSlaDetailsWithTimestamps(service, e.Id);
+
+                    var currentStage = MapStatusCodeToStage(e);
+
+                    var csat = GetCustomerSatisfactionFeedback(service, e.Id);
+
+                    return new
+                    {
+                        TicketID = e.GetAttributeValue<string>("ticketnumber"),
+                        CreatedBy = e.GetAttributeValue<EntityReference>("createdby")?.Name,
+                        AgentName = e.GetAttributeValue<EntityReference>("ownerid")?.Name,
+                        CustomerID = e.GetAttributeValue<EntityReference>("customerid")?.Id,
+                        CustomerName = e.GetAttributeValue<EntityReference>("customerid")?.Name,
+                        CustomerCrNumber = GetCustomerCrNumber(service, e.GetAttributeValue<EntityReference>("customerid")),
+                        CreatedOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("createdon"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+                        TicketType = e.GetAttributeValue<EntityReference>("new_tickettype")?.Name,
+                        MineralClass = e.FormattedValues.Contains("new_class") ? e.FormattedValues["new_class"] : null,
+                        Category = e.GetAttributeValue<EntityReference>("new_tickettype")?.Name,
+                        SubCategory1 = e.GetAttributeValue<EntityReference>("new_mainclassification")?.Name,
+                        SubCategory2 = e.GetAttributeValue<EntityReference>("new_subclassificationitem")?.Name,
+                        Status = e.FormattedValues.Contains("statuscode") ? e.FormattedValues["statuscode"] : null,
+                        TicketModifiedDateTime = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("modifiedon"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+                        Department = e.Attributes.Contains("new_businessunitid") ? ((EntityReference)e["new_businessunitid"]).Name : null,
+                        TicketChannel = e.FormattedValues.Contains("new_ticketsubmissionchannel") ? e.FormattedValues["new_ticketsubmissionchannel"] : null,
+                        TotalTicketDuration = CalculateDurationFormatted(e),
+                        Description = e.GetAttributeValue<string>("new_description"),
+                        ModifiedBy = e.GetAttributeValue<EntityReference>("modifiedby")?.Name,
+                        Priority = e.FormattedValues.Contains("prioritycode") ? e.FormattedValues["prioritycode"] : null,
+                        ResolutionDateTime = GetResolutionDateTime(e)?.ToString("yyyy-MM-dd HH:mm:ss"),
+                        SurveyRespondedOn = csat.surveyCreatedOn,
+                        Customer_Satisfaction_Score = csat.Comment,
+                        How_Satisfied_Are_You_With_How_The_Ticket_Was_Handled = csat.Score,
+                        Was_the_Time_Taken_to_process_the_ticket_Appropriate = csat.AppropriateTimeTaken,
+                        How_can_we_Improve_the_ticket_processing_experience = csat.ImprovementComment,
+                        IsReopened = string.IsNullOrWhiteSpace(e.GetAttributeValue<string>("new_isreopened")) ? "No" : e.GetAttributeValue<string>("new_isreopened"),
+                        CurrentStage = currentStage,
+                        EscalationLevel = GetEscalationLevel(e),
+                        ReopenedOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_reopendatetime"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+
+                        AssignmentSucceededOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_assignmentsucceededon"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+                        ProcessingSucceededOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_processingsucceededon"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+                        SolutionVerificationSucceededOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_solutionverificationsucceededon"))?.ToString("yyyy-MM-dd HH:mm:ss"),
+
+                        AssignmentSlaViolationL1 = e.GetAttributeValue<bool?>("new_assignmentslaviolationl1") == true ? "Yes" : "No",
+                        AssignmentSlaViolationL2 = e.GetAttributeValue<bool?>("new_assignmentslaviolationl2") == true ? "Yes" : "No",
+                        AssignmentSlaViolationL3 = e.GetAttributeValue<bool?>("new_assignmentslaviolationl3") == true ? "Yes" : "No",
+
+                        ProcessingSlaViolationL1 = e.GetAttributeValue<bool?>("new_slaviolationl1") == true ? "Yes" : "No",
+                        ProcessingSlaViolationL2 = e.GetAttributeValue<bool?>("new_slaviolationl2") == true ? "Yes" : "No",
+                        ProcessingSlaViolationL3 = e.GetAttributeValue<bool?>("new_slaviolationl3") == true ? "Yes" : "No",
+                        ProcessingSlaViolationL4 = e.GetAttributeValue<bool?>("new_slaviolationl4") == true ? "Yes" : "No",
+
+                        VerificationSlaViolationL1 = e.GetAttributeValue<bool?>("new_verificationslaviolationl1") == true ? "Yes" : "No",
+                        VerificationSlaViolationL2 = e.GetAttributeValue<bool?>("new_verificationslaviolationl2") == true ? "Yes" : "No",
+                        VerificationSlaViolationL3 = e.GetAttributeValue<bool?>("new_verificationslaviolationl3") == true ? "Yes" : "No",
+                    };
+                }).ToList();
+
+                return Ok(new
+                {
+                    Filter = filter,
+                    Page = page,
+                    PageSize = effectivePageSize,
+                    Count = currentPageCount,
+                    TotalTickets = overallSystemRecords,
+                    FilteredTotalTickets = filteredTotalRecords,
+                    TotalPages = totalPages,
+                    Records = records
+                });
+            }
+            catch (Exception ex)
+            {
+                return InternalServerError(new Exception($"Report API failed: {ex.Message}"));
+            }
+        }
+
+        private object GetSafeValue(Dictionary<string, Dictionary<string, object>> dict, string key, string innerKey)
+        {
+            return dict.ContainsKey(key) && dict[key].ContainsKey(innerKey) ? dict[key][innerKey] : null;
+        }
+
+        private int GetOverallIncidentCount(IOrganizationService service)
+        {
+            var countQuery = new QueryExpression("incident")
+            {
+                ColumnSet = new ColumnSet(false),
+                PageInfo = new PagingInfo
+                {
+                    PageNumber = 1,
+                    Count = 1,
+                    ReturnTotalRecordCount = true
+                }
             };
 
-            query.Orders.Add(new OrderExpression("createdon", OrderType.Descending));
+            var result = service.RetrieveMultiple(countQuery);
+            return result.TotalRecordCount;
+        }
 
-            var ksaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
-            var ksaNow = TimeZoneInfo.ConvertTimeFromUtc(DateTime.UtcNow, ksaTimeZone);
-            DateTime ksaStart;
+        private DateTime? ConvertToKsaTime(DateTime? utcDate)
+        {
+            if (!utcDate.HasValue)
+                return null;
 
-            if (filter.ToLower() == "daily")
+            TimeZoneInfo ksaZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
+            return TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utcDate.Value, DateTimeKind.Utc), ksaZone);
+        }
+
+        private DateTime? GetResolutionDateTime(Entity incident)
+        {
+            var resolvedStatusCodes = new HashSet<int> { 5, 6, 100000003, 100000007, 2000 };
+
+            if (incident.Contains("resolveby") && incident["resolveby"] is DateTime closure)
+                return ConvertToKsaTime(closure);
+
+            if (incident.Contains("statuscode") && incident["statuscode"] is OptionSetValue status &&
+                resolvedStatusCodes.Contains(status.Value) &&
+                incident.Contains("modifiedon") && incident["modifiedon"] is DateTime modified)
+                return ConvertToKsaTime(modified);
+
+            return null;
+        }
+        private string GetEscalationLevel(Entity e)
+        {
+            // Track escalation level text
+            string escalation = "No Escalation";
+
+            // ✅ Approval (check all levels, update if found)
+            if (e.GetAttributeValue<bool?>("new_assignmentslaviolationl1") == true) escalation = "Approval Escalation - Level 1";
+            if (e.GetAttributeValue<bool?>("new_assignmentslaviolationl2") == true) escalation = "Approval Escalation - Level 2";
+            if (e.GetAttributeValue<bool?>("new_assignmentslaviolationl3") == true) escalation = "Approval Escalation - Level 3";
+
+            // ✅ Processing (overwrite if later escalation found)
+            if (e.GetAttributeValue<bool?>("new_slaviolationl1") == true) escalation = "Processing Escalation - Level 1";
+            if (e.GetAttributeValue<bool?>("new_slaviolationl2") == true) escalation = "Processing Escalation - Level 2";
+            if (e.GetAttributeValue<bool?>("new_slaviolationl3") == true) escalation = "Processing Escalation - Level 3";
+            if (e.GetAttributeValue<bool?>("new_slaviolationl4") == true) escalation = "Processing Escalation - Level 4";
+
+            // ✅ Verification (overwrite if even later escalation found)
+            if (e.GetAttributeValue<bool?>("new_verificationslaviolationl1") == true) escalation = "Verification Escalation - Level 1";
+            if (e.GetAttributeValue<bool?>("new_verificationslaviolationl2") == true) escalation = "Verification Escalation - Level 2";
+            if (e.GetAttributeValue<bool?>("new_verificationslaviolationl3") == true) escalation = "Verification Escalation - Level 3";
+
+            return escalation;
+        }
+        private string CalculateDurationFormatted(Entity incident)
+        {
+            // Convert CreatedOn to CreatedOnDate
+            DateTime? createdOn = ConvertToKsaTime(incident.GetAttributeValue<DateTime?>("createdon"));
+            DateTime? resolvedOn = GetResolutionDateTime(incident);
+
+            if (!createdOn.HasValue || !resolvedOn.HasValue)
+                return null;
+
+            // Calculate duration
+            TimeSpan duration = resolvedOn.Value - createdOn.Value;
+
+            // Format as HH:mm:ss (cumulative hours)
+            return string.Format("{0:D2}:{1:D2}:{2:D2}",
+                (int)duration.TotalHours,
+                duration.Minutes,
+                duration.Seconds);
+        }
+
+        private (int? Score, string Comment, string AppropriateTimeTaken, string ImprovementComment, string surveyCreatedOn)
+            GetCustomerSatisfactionFeedback(IOrganizationService service, Guid caseId)
+        {
+            var query = new QueryExpression("new_customersatisfactionscore")
             {
-                ksaStart = ksaNow.Date;
-                query.Criteria.AddCondition("createdon", ConditionOperator.OnOrAfter, ksaStart);
-            }
-            else if (filter.ToLower() == "weekly")
-            {
-                ksaStart = ksaNow.Date.AddDays(-7); // ✅ Last 7 days, not week start
-                query.Criteria.AddCondition("createdon", ConditionOperator.OnOrAfter, ksaStart);
-            }
-            else if (filter.ToLower() == "monthly")
-            {
-                ksaStart = new DateTime(ksaNow.Year, ksaNow.Month, 1);
-                query.Criteria.AddCondition("createdon", ConditionOperator.OnOrAfter, ksaStart);
-            }
+                ColumnSet = new ColumnSet("new_customersatisfactionrating",
+                                          "new_customersatisfactionscore",
+                                          "new_wasthetimetakentoprocesstheticketappropri",
+                                          "new_comment","createdon"),
+                Criteria = new FilterExpression
+                {
+                    Conditions = { new ConditionExpression("new_csatcase", ConditionOperator.Equal, caseId) }
+                }
+            };
 
             var result = service.RetrieveMultiple(query);
+            var record = result.Entities.FirstOrDefault();
+            if (record == null)
+                return (null, null, null, null,null);
 
-            var records = result.Entities.Select(e =>
+            var score = record.GetAttributeValue<OptionSetValue>("new_customersatisfactionrating")?.Value;
+            var comment = record.GetAttributeValue<string>("new_customersatisfactionscore");
+            var improvementComment = record.GetAttributeValue<string>("new_comment");
+            string surveyCreatedOn = ConvertToKsaTime(record.GetAttributeValue<DateTime?>("createdon"))?.ToString("yyyy-MM-dd HH:mm:ss");
+            string appropriateTimeTaken = null;
+
+            if (record.FormattedValues.Contains("new_wasthetimetakentoprocesstheticketappropri"))
             {
-                var slaDetails = GetSlaDetailsWithTimestamps(service, e.Id);
-                var currentStage = MapStatusCodeToStage(e);
-                var escalationLevel = GetEscalationLevel(slaDetails);
-                var csat = GetCustomerSatisfactionFeedback(service, e.Id);
+                appropriateTimeTaken = record.FormattedValues["new_wasthetimetakentoprocesstheticketappropri"];
+            }
+            else
+            {
+                appropriateTimeTaken = record.GetAttributeValue<string>("new_wasthetimetakentoprocesstheticketappropri");
+            }
 
-                return new
+            return (score, comment, appropriateTimeTaken, improvementComment, surveyCreatedOn);
+        }
+
+        private Dictionary<string, Dictionary<string, object>> GetSlaDetailsWithTimestamps(IOrganizationService service, Guid caseId)
+        {
+            var query = new QueryExpression("slakpiinstance")
+            {
+                ColumnSet = new ColumnSet("name", "failuretime", "succeededon"), // ✅ status & warningtime removed
+                Criteria = new FilterExpression
                 {
-                    TicketID = e.GetAttributeValue<string>("ticketnumber"),
-                    CreatedBy = e.GetAttributeValue<EntityReference>("createdby")?.Name,
-                    AgentName = e.GetAttributeValue<EntityReference>("ownerid")?.Name,
-                    CustomerID = e.GetAttributeValue<EntityReference>("customerid")?.Id,
-                    CustomerName = e.GetAttributeValue<EntityReference>("customerid")?.Name,
-                    CreatedOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("createdon")),
-                    TicketType = e.GetAttributeValue<EntityReference>("new_tickettype")?.Name,
-                    Category = e.GetAttributeValue<EntityReference>("new_tickettype")?.Name,
-                    SubCategory1 = e.GetAttributeValue<EntityReference>("new_mainclassification")?.Name,
-                    SubCategory2 = e.GetAttributeValue<EntityReference>("new_subclassificationitem")?.Name,
-                    Status = e.FormattedValues.Contains("statuscode") ? e.FormattedValues["statuscode"] : null,
-                    TicketModifiedDateTime = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("modifiedon")),
-                    Department = e.Attributes.Contains("new_businessunitid") ? ((EntityReference)e["new_businessunitid"]).Name : null,
-                    TicketChannel = e.FormattedValues.Contains("new_ticketsubmissionchannel") ? e.FormattedValues["new_ticketsubmissionchannel"] : null,
-                    //TotalResolutionTime = (e.Contains("new_ticketclosuredate") && e.Contains("createdon"))
-                    //    ? (e.GetAttributeValue<DateTime>("new_ticketclosuredate") - e.GetAttributeValue<DateTime>("createdon")).ToString(@"hh\:mm\:ss")
-                    //    : null,
+                    Conditions = { new ConditionExpression("regarding", ConditionOperator.Equal, caseId) }
+                }
+            };
 
-                    TotalResolutionTime = CalculateDurationFormatted(e),
+            var result = service.RetrieveMultiple(query);
+            var ksaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
 
-                    Description = e.GetAttributeValue<string>("new_description"),
-                    ModifiedBy = e.GetAttributeValue<EntityReference>("modifiedby")?.Name,
-                    Priority = e.FormattedValues.Contains("prioritycode") ? e.FormattedValues["prioritycode"] : null,
-                    //ClosedOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_ticketclosuredate")),
+            var details = new Dictionary<string, Dictionary<string, object>>();
 
-                    ResolutionDateTime = GetResolutionDateTime(e),
+            foreach (var kpi in result.Entities)
+            {
+                var rawName = kpi.GetAttributeValue<string>("name");
+                if (string.IsNullOrWhiteSpace(rawName)) continue;
 
-                    Customer_Satisfaction_Score = csat.Comment,
-                    How_Satisfied_Are_You_With_How_The_Ticket_Was_Handled = csat.Score,
-                    Was_the_Time_Taken_to_process_the_ticket_Appropriate = csat.AppropriateTimeTaken,
-                    How_can_we_Improve_the_ticket_processing_experience = csat.ImprovementComment,
+                var normalizedKey = rawName
+                    .Replace(" ", "")
+                    .Replace("–", "") // remove en-dash
+                    .Replace("-", "") // remove hyphen
+                    .Replace("byKPI", "ByKPI");
 
-                    IsReopened = string.IsNullOrWhiteSpace(e.GetAttributeValue<string>("new_isreopened")) ? "No" : e.GetAttributeValue<string>("new_isreopened"),
+                if (!details.ContainsKey(normalizedKey))
+                    details[normalizedKey] = new Dictionary<string, object>();
 
-                    SlaViolation = GetSlaViolationStatus(service, e.Id),
+                DateTime? failureTime = kpi.GetAttributeValue<DateTime?>("failuretime");
+                DateTime? succeededOn = kpi.GetAttributeValue<DateTime?>("succeededon");
 
-                    AssignmentTimeByKPI = slaDetails.ContainsKey("AssignmentTimeByKPI") ? slaDetails["AssignmentTimeByKPI"]["Status"] : null,
-                    ProcessingTimeByKPI = slaDetails.ContainsKey("ProcessingTimeByKPI") ? slaDetails["ProcessingTimeByKPI"]["Status"] : null,
-                    SolutionVerificationTimeByKPI = slaDetails.ContainsKey("SolutionVerificationTimeByKPI") ? slaDetails["SolutionVerificationTimeByKPI"]["Status"] : null,
+                details[normalizedKey]["FailureTime"] = failureTime.HasValue
+                    ? TimeZoneInfo.ConvertTimeFromUtc(failureTime.Value, ksaTimeZone).ToString("yyyy-MM-dd HH:mm:ss")
+                    : null;
 
-                    CurrentStage = currentStage,
-                    EscalationLevel = escalationLevel,
+                details[normalizedKey]["SucceededOn"] = succeededOn.HasValue
+                    ? TimeZoneInfo.ConvertTimeFromUtc(succeededOn.Value, ksaTimeZone).ToString("yyyy-MM-dd HH:mm:ss")
+                    : null;
+            }
 
-                    ReopenedOn = ConvertToKsaTime(e.GetAttributeValue<DateTime?>("new_reopendatetime")),
-
-
-
-                    AssignmentWarningTime = slaDetails.ContainsKey("AssignmentTimeByKPI") ? slaDetails["AssignmentTimeByKPI"]["WarningTime"] : null,
-                    AssignmentFailureTime = slaDetails.ContainsKey("AssignmentTimeByKPI") ? slaDetails["AssignmentTimeByKPI"]["FailureTime"] : null,
-                    AssignmentSucceededOn = slaDetails.ContainsKey("AssignmentTimeByKPI") ? slaDetails["AssignmentTimeByKPI"]["SucceededOn"] : null,
-
-                    ProcessingWarningTime = slaDetails.ContainsKey("ProcessingTimeByKPI") ? slaDetails["ProcessingTimeByKPI"]["WarningTime"] : null,
-                    ProcessingFailureTime = slaDetails.ContainsKey("ProcessingTimeByKPI") ? slaDetails["ProcessingTimeByKPI"]["FailureTime"] : null,
-                    ProcessingSucceededOn = slaDetails.ContainsKey("ProcessingTimeByKPI") ? slaDetails["ProcessingTimeByKPI"]["SucceededOn"] : null,
-
-                    SolutionVerificationWarningTime = slaDetails.ContainsKey("SolutionVerificationTimeByKPI") ? slaDetails["SolutionVerificationTimeByKPI"]["WarningTime"] : null,
-                    SolutionVerificationFailureTime = slaDetails.ContainsKey("SolutionVerificationTimeByKPI") ? slaDetails["SolutionVerificationTimeByKPI"]["FailureTime"] : null,
-                    SolutionVerificationSucceededOn = slaDetails.ContainsKey("SolutionVerificationTimeByKPI") ? slaDetails["SolutionVerificationTimeByKPI"]["SucceededOn"] : null,
-
-                };
-            }).ToList();
-
-            return Ok(new { Page = page, PageSize = pageSize, Count = records.Count, Records = records });
+            return details;
         }
-        catch (Exception ex)
+        private string GetCustomerCrNumber(IOrganizationService service, EntityReference customerRef)
         {
-            return InternalServerError(ex);
-        }
-    }
+            if (customerRef == null) return null;
 
-    private DateTime? ConvertToKsaTime(DateTime? utcDate)
-    {
-        if (!utcDate.HasValue)
+            // candidate attribute logical names for CR number (update with your real schema name if needed)
+            var candidateAttrs = new[]
+            {
+                "new_crnumber"
+            };
+
+            // local func to attempt retrieve and read any candidate attribute
+            string TryGetFromRecord(string logicalName, Guid id)
+            {
+                try
+                {
+                    var cols = new ColumnSet(candidateAttrs);
+                    var rec = service.Retrieve(logicalName, id, cols);
+                    foreach (var a in candidateAttrs)
+                    {
+                        if (rec.Attributes.Contains(a))
+                        {
+                            var val = rec.GetAttributeValue<string>(a);
+                            if (!string.IsNullOrWhiteSpace(val)) return val;
+                        }
+                    }
+                }
+                catch
+                {
+                    // swallow and return null - retrieval failure shouldn't crash report
+                }
+                return null;
+            }
+
+            // If customer is account, read account directly
+            if (string.Equals(customerRef.LogicalName, "account", StringComparison.OrdinalIgnoreCase))
+            {
+                return TryGetFromRecord("account", customerRef.Id);
+            }
+
+            // If customer is contact, check contact, then check contact's parentaccount (parentcustomerid)
+            if (string.Equals(customerRef.LogicalName, "contact", StringComparison.OrdinalIgnoreCase))
+            {
+                // try contact first
+                var fromContact = TryGetFromRecord("contact", customerRef.Id);
+                if (!string.IsNullOrWhiteSpace(fromContact)) return fromContact;
+
+                // try parent account if contact points to one
+                try
+                {
+                    var contact = service.Retrieve("contact", customerRef.Id, new ColumnSet("new_companyname"));
+                    if (contact != null && contact.Attributes.Contains("new_companyname"))
+                    {
+                        var parent = contact.GetAttributeValue<EntityReference>("new_companyname");
+                        if (parent != null && string.Equals(parent.LogicalName, "account", StringComparison.OrdinalIgnoreCase))
+                        {
+                            var fromParentAccount = TryGetFromRecord("account", parent.Id);
+                            if (!string.IsNullOrWhiteSpace(fromParentAccount)) return fromParentAccount;
+                        }
+                    }
+                }
+                catch
+                {
+                    // ignore
+                }
+            }
+
+            // fallback nothing found
             return null;
-
-        TimeZoneInfo ksaZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
-        return TimeZoneInfo.ConvertTimeFromUtc(DateTime.SpecifyKind(utcDate.Value, DateTimeKind.Utc), ksaZone);
-    }
-
-    private DateTime? GetResolutionDateTime(Entity incident)
-    {
-        var resolvedStatusCodes = new HashSet<int> { 5, 6, 100000003, 100000007, 2000 };
-
-        if (incident.Contains("new_ticketclosuredate") && incident["new_ticketclosuredate"] is DateTime closure)
-            return ConvertToKsaTime(closure);
-
-        if (incident.Contains("statuscode") && incident["statuscode"] is OptionSetValue status &&
-            resolvedStatusCodes.Contains(status.Value) &&
-            incident.Contains("modifiedon") && incident["modifiedon"] is DateTime modified)
-            return ConvertToKsaTime(modified);
-
-        return null;
-    }
-    private Dictionary<string, Dictionary<string, object>> GetSlaDetailsWithTimestamps(IOrganizationService service, Guid caseId)
-    {
-        var query = new QueryExpression("slakpiinstance")
-        {
-            ColumnSet = new ColumnSet("name", "status", "failuretime", "warningtime", "succeededon"), // ✅ Fixed: removed "regardingobjectid"
-            Criteria = new FilterExpression
-            {
-                Conditions = { new ConditionExpression("regarding", ConditionOperator.Equal, caseId) }
-            }
-        };
-
-        var result = service.RetrieveMultiple(query);
-        var ksaTimeZone = TimeZoneInfo.FindSystemTimeZoneById("Arab Standard Time");
-
-        var details = new Dictionary<string, Dictionary<string, object>>();
-
-        foreach (var kpi in result.Entities)
-        {
-            var rawName = kpi.GetAttributeValue<string>("name");
-            if (string.IsNullOrWhiteSpace(rawName)) continue;
-
-            var normalizedKey = rawName.Replace(" ", "").Replace("byKPI", "ByKPI");
-
-            if (!details.ContainsKey(normalizedKey))
-            {
-                details[normalizedKey] = new Dictionary<string, object>();
-            }
-
-            var status = kpi.FormattedValues.Contains("status") ? kpi.FormattedValues["status"] : null;
-
-            DateTime? failureTime = kpi.GetAttributeValue<DateTime?>("failuretime");
-            DateTime? warningTime = kpi.GetAttributeValue<DateTime?>("warningtime");
-            DateTime? succeededOn = kpi.GetAttributeValue<DateTime?>("succeededon");
-
-            details[normalizedKey]["Status"] = status;
-            details[normalizedKey]["FailureTime"] = failureTime.HasValue
-                ? TimeZoneInfo.ConvertTimeFromUtc(failureTime.Value, ksaTimeZone).ToString("yyyy-MM-dd HH:mm:ss")
-                : null;
-            details[normalizedKey]["WarningTime"] = warningTime.HasValue
-                ? TimeZoneInfo.ConvertTimeFromUtc(warningTime.Value, ksaTimeZone).ToString("yyyy-MM-dd HH:mm:ss")
-                : null;
-            details[normalizedKey]["SucceededOn"] = succeededOn.HasValue
-                ? TimeZoneInfo.ConvertTimeFromUtc(succeededOn.Value, ksaTimeZone).ToString("yyyy-MM-dd HH:mm:ss")
-                : null;
         }
-
-        return details;
-    }
-
-    private string GetSlaViolationStatus(IOrganizationService service, Guid caseId)
-    {
-        var query = new QueryExpression("slakpiinstance")
+        private string MapStatusCodeToStage(Entity ticket)
         {
-            ColumnSet = new ColumnSet("name", "status"),
-            Criteria = new FilterExpression
+            var statusCode = ticket.GetAttributeValue<OptionSetValue>("statuscode")?.Value;
+            switch (statusCode)
             {
-                Conditions = { new ConditionExpression("regarding", ConditionOperator.Equal, caseId) }
-            }
-        };
-
-        var result = service.RetrieveMultiple(query);
-
-        foreach (var kpi in result.Entities)
-        {
-            var rawName = kpi.GetAttributeValue<string>("name") ?? "";
-            var normalizedName = rawName.Replace(" ", "").Replace("byKPI", "ByKPI");
-            var statusFormatted = kpi.FormattedValues.Contains("status") ? kpi.FormattedValues["status"] : null;
-
-            if (!string.IsNullOrEmpty(statusFormatted) &&
-                statusFormatted.ToLower().Contains("noncompliant") &&
-                (
-                    normalizedName == "AssignmentTimeByKPI" ||
-                    normalizedName == "ProcessingTimeByKPI" ||
-                    normalizedName == "SolutionVerificationTimeByKPI"
-                ))
-            {
-                return "Yes";
+                case 100000000: return "Ticket Creation";
+                case 100000006: return "Approval and Forwarding";
+                case 100000002: return "Solution Verification";
+                case 100000008: return "Processing";
+                case 1: return "Processing- Department";
+                case 100000001: return "Return to Customer";
+                case 100000003: return "Ticket Closure";
+                case 100000005: return "Ticket Reopen";
+                case 5: return "Problem Solved";
+                case 1000: return "Information Provided";
+                case 6: return "Cancelled";
+                case 2000: return "Merged";
+                case 100000007: return "Close";
+                default: return "Unknown";
             }
         }
 
-        return "No";
     }
-
-    private (int? Score, string Comment, string AppropriateTimeTaken, string ImprovementComment) GetCustomerSatisfactionFeedback(IOrganizationService service, Guid caseId)
-    {
-        var query = new QueryExpression("new_customersatisfactionscore")
-        {
-            ColumnSet = new ColumnSet("new_customersatisfactionrating", "new_customersatisfactionscore", "new_wasthetimetakentoprocesstheticketappropri", "new_comment"),
-            Criteria = new FilterExpression
-            {
-                Conditions = { new ConditionExpression("new_csatcase", ConditionOperator.Equal, caseId) }
-            }
-        };
-
-        var result = service.RetrieveMultiple(query);
-        var record = result.Entities.FirstOrDefault();
-        if (record == null)
-            return (null, null, null, null);
-
-        var score = record.GetAttributeValue<OptionSetValue>("new_customersatisfactionrating")?.Value;
-        var comment = record.GetAttributeValue<string>("new_customersatisfactionscore");
-        var improvementComment = record.GetAttributeValue<string>("new_comment");
-
-        string appropriateTimeTaken = null;
-        if (record.Attributes.Contains("new_wasthetimetakentoprocesstheticketappropri"))
-        {
-            var timeTaken = record.GetAttributeValue<bool?>("new_wasthetimetakentoprocesstheticketappropri");
-            appropriateTimeTaken = timeTaken.HasValue ? (timeTaken.Value ? "Yes" : "No") : null;
-        }
-
-        return (score, comment, appropriateTimeTaken, improvementComment);
-    }
-
-    private string MapStatusCodeToStage(Entity ticket)
-    {
-        var statusCode = ticket.GetAttributeValue<OptionSetValue>("statuscode")?.Value;
-        switch (statusCode)
-        {
-            case 100000000: return "Ticket Creation";
-            case 100000006: return "Approval and Forwarding";
-            case 100000002: return "Solution Verification";
-            case 100000008: return "Processing";
-            case 1: return "Processing- Department";
-            case 100000001: return "Return to Customer";
-            case 100000003: return "Ticket Closure";
-            case 100000005: return "Ticket Reopen";
-            case 5: return "Problem Solved";
-            case 1000: return "Information Provided";
-            case 6: return "Cancelled";
-            case 2000: return "Merged";
-            case 100000007: return "Close";
-            default: return "Unknown";
-        }
-    }
-
-    private string GetEscalationLevel(Dictionary<string, Dictionary<string, object>> slaStatuses)
-    {
-        bool isAssignmentInProgress = string.Equals(slaStatuses["AssignmentTimeByKPI"]?["Status"]?.ToString(), "In Progress", StringComparison.OrdinalIgnoreCase);
-        bool isProcessingInProgress = string.Equals(slaStatuses["ProcessingTimeByKPI"]?["Status"]?.ToString(), "In Progress", StringComparison.OrdinalIgnoreCase);
-        bool isVerificationInProgress = string.Equals(slaStatuses["SolutionVerificationTimeByKPI"]?["Status"]?.ToString(), "In Progress", StringComparison.OrdinalIgnoreCase);
-
-        if (isAssignmentInProgress && isProcessingInProgress && isVerificationInProgress)
-            return "Level 1";
-        if (!isAssignmentInProgress && isProcessingInProgress && isVerificationInProgress)
-            return "Level 2";
-        if (!isAssignmentInProgress && !isProcessingInProgress && isVerificationInProgress)
-            return "Level 3";
-
-        return null;
-    }
-    private string CalculateDurationFormatted(Entity incident)
-    {
-        // Convert CreatedOn to KSA
-        DateTime? createdOn = ConvertToKsaTime(incident.GetAttributeValue<DateTime?>("createdon"));
-        DateTime? resolvedOn = GetResolutionDateTime(incident);
-
-        if (!createdOn.HasValue || !resolvedOn.HasValue)
-            return null;
-
-        // Calculate duration
-        TimeSpan duration = resolvedOn.Value - createdOn.Value;
-
-        // Format as HH:mm:ss (cumulative hours)
-        return string.Format("{0:D2}:{1:D2}:{2:D2}",
-            (int)duration.TotalHours,
-            duration.Minutes,
-            duration.Seconds);
-    }
-
 }

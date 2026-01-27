@@ -1,15 +1,42 @@
-﻿var builder = WebApplication.CreateBuilder(args);
+﻿using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Hosting;
+using System.IO;
 
-// Optional: Add services if needed
-// builder.Services.AddRazorPages(); 
+var builder = WebApplication.CreateBuilder(args);
 
 var app = builder.Build();
 
-// Ensure it serves wwwroot static files
-app.UseDefaultFiles();      // 👈 serves index.html by default if available
-app.UseStaticFiles();       // 👈 serves all files from wwwroot
+// Serve static files (index.html by default)
+app.UseDefaultFiles();
+app.UseStaticFiles();
 
-// Optional: Fallback to index.html for SPA apps (like React/Vue/Angular)
+// Map /Visitor to VisitorSurvey.html
+app.MapGet("/Visitor", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.SendFileAsync(
+        Path.Combine(app.Environment.WebRootPath, "VisitorSurvey.html")
+    );
+});
+
+// Map /KITicket to feedback.html
+app.MapGet("/KITicket", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.SendFileAsync(
+        Path.Combine(app.Environment.WebRootPath, "feedback.html")
+    );
+});
+app.MapGet("/KICommunication", async context =>
+{
+    context.Response.ContentType = "text/html";
+    await context.Response.SendFileAsync(
+        Path.Combine(app.Environment.WebRootPath, "InvestorsCommunication.html")
+    );
+});
+
+
+// If you still want SPA fallback, uncomment below:
 // app.MapFallbackToFile("index.html");
 
 app.Run();
